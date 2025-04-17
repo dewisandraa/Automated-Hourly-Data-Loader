@@ -13,37 +13,56 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-# def ensure_metadata_table(conn):
-#     conn.execute(f"""
-#         CREATE TABLE IF NOT EXISTS {METADATA_TABLE} (
-#             hour_key VARCHAR PRIMARY KEY,
-#             processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-#         );
-#     """)
-
 def get_next_hour_to_process(conn):
-    # ensure_metadata_table(conn)
-    result = conn.execute(f"SELECT MAX(hour_key) FROM {METADATA_TABLE}").fetchone()[0]
-    # all_hours = []
-    print(result)
-    next_hour = datetime.strptime(result, "%Y%m%d/%H") + timedelta(hours=1)
-    # else:
-    #     for date in os.listdir(DATA_PATH):
-    #         date_path = os.path.join(DATA_PATH, date)
-    #         if os.path.isdir(date_path):
-    #             for hour in os.listdir(date_path):
-    #                 hour_path = os.path.join(date_path, hour)
-    #                 if os.path.isdir(hour_path):
-    #                     all_hours.append(f"{date}/{hour}")
+    """Get the next hour to process based on metadata table"""
+    try:
+        # Check if metadata table exists
+        result = conn.execute(f"""
+            SELECT EXISTS (
+                SELECT 1 
+                FROM information_schema.tables 
+                WHERE table_schema = 'main' 
+                AND table_name = '{METADATA_TABLE}'
+            )
+        """).fetchone()[0]
 
-    #     if not all_hours:
-    #         return None
+        if not result:
+            return None
 
-    #     next_hour = min(datetime.strptime(h, "%Y%m%d/%H") for h in all_hours)
+        # Get the maximum processed hour
+        max_hour = conn.execute(f"""
+            SELECT MAX(hour_key) 
+            FROM {METADATA_TABLE}
+        """).fetchone()[0]
 
-    return next_hour.strftime("%Y%m%d/%H")
+        if not max_hour:
+            return None
+
+        # Calculate next hour
+        last_dt = datetime.strptime(max_hour, "%Y%m%d/%H")
+        next_dt = last_dt + timedelta(hours=1)
+        return next_dt.strftime("%Y%m%d/%H")
+
+    except duckdb.CatalogException:
+        return None
+
+def find_earliest_hour():
+    """Find the earliest unprocessed hour in data directory"""
+    try:
+        dates = []
+        for date_dir in os.listdir(DATA_PATH):
+            date_path = os.path.join(DATA_PATH, date_dir)
+            if os.path.isdir(date_path):
+                for hour_dir in sorted(os.listdir(date_path)):
+                    hour_path = os.path.join(date_path, hour_dir)
+                    if os.path.isdir(hour_path):
+                        return f"{date_dir}/{hour_dir}"
+        return None
+    except FileNotFoundError:
+        return None
 
 def process_hour(conn, date_hour):
+    """Process a single hour of data"""
     date, hour = date_hour.split("/")
     base_path = os.path.join(DATA_PATH, date, hour)
 
@@ -59,20 +78,32 @@ def process_hour(conn, date_hour):
 
             logging.info(f"Processing {file_path} into table {table}")
             try:
+                # Create table if not exists
                 conn.execute(f"""
-                    CREATE TABLE IF NOT EXISTS {table} AS 
-                    SELECT * FROM read_csv_auto('{file_path}') LIMIT 0;
+                    CREATE TABLE IF NOT EXISTS {table} (
+                        id INTEGER PRIMARY KEY,
+                        amount FLOAT,
+                        transaction_date DATE,
+                        hour INTEGER
+                    )
                 """)
+                
+                # Insert data
                 conn.execute(f"""
                     INSERT INTO {table}
-                    SELECT * FROM read_csv_auto('{file_path}');
+                    SELECT *
+                    FROM read_csv_auto('{file_path}')
                 """)
+                
                 processed = True
             except Exception as e:
                 logging.error(f"Failed to process {file_path}: {e}")
 
     if processed:
-        conn.execute(f"INSERT INTO {METADATA_TABLE} (hour_key) VALUES (?)", [date_hour])
+        conn.execute(f"""
+            INSERT INTO {METADATA_TABLE} (hour_key)
+            VALUES (?)
+        """, [date_hour])
         logging.info(f"Finished processing hour {date_hour}")
     else:
         logging.info(f"No CSV files processed for {date_hour}")
@@ -81,15 +112,29 @@ def process_hour(conn, date_hour):
 
 if __name__ == "__main__":
     conn = duckdb.connect(DB_PATH)
-    result = conn.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'main';").fetchone()[0]
-    if not result:
-        logging.info("Database is empty. Initializing DB...")
+    
+    # Initialize if empty
+    if not conn.execute("""
+        SELECT EXISTS (
+            SELECT 1 
+            FROM information_schema.tables 
+            WHERE table_schema = 'main'
+        )
+    """).fetchone()[0]:
+        logging.info("Initializing database...")
         initialize_db()
     else:
-        date_hour_to_process = get_next_hour_to_process(conn)
-        if date_hour_to_process:
-            if process_hour(conn, date_hour_to_process):
-                print(f"Processed {date_hour_to_process}")
-            else:
-                print(f"No new data to process for {date_hour_to_process}")
+        # Get next hour to process
+        next_hour = get_next_hour_to_process(conn)
 
+        # If no processed hours, find earliest available
+        if not next_hour:
+            next_hour = find_earliest_hour()
+        
+        if next_hour:
+            if process_hour(conn, next_hour):
+                print(f"Successfully processed {next_hour}")
+            else:
+                print(f"No new data in {next_hour}")
+        else:
+            print("No hours to process")
